@@ -15,6 +15,8 @@
 // commercial license or contractual agreement.
 
 #include <algorithm>
+#include <cmath>
+#include <iostream>
 #include <GeomInt_IntSS.hxx>
 
 #include <Adaptor3d_TopolTool.hxx>
@@ -91,6 +93,125 @@ static void AdjustUPeriodic(const Handle(Geom_Surface)& aS, const Handle(Geom2d_
   {
     gp_Vec2d aV2D(dU, 0.);
     aC2D->Translate(aV2D);
+  }
+}
+
+//=================================================================================================
+
+static Standard_Boolean IsPeriodicSurface(const Handle(Geom_Surface)& theSurface)
+{
+  return !theSurface.IsNull() && (theSurface->IsUPeriodic() || theSurface->IsVPeriodic());
+}
+
+//=================================================================================================
+
+static Standard_Boolean MaxCurveSurfaceDeviation(const Handle(Geom_Curve)&   theCurve,
+                                                 const Handle(Geom_Surface)& theSurface,
+                                                 const Standard_Integer      theNbSamples,
+                                                 Standard_Real&              theMaxDeviation)
+{
+  theMaxDeviation = 0.0;
+  if (theCurve.IsNull() || theSurface.IsNull() || theNbSamples < 2)
+  {
+    return Standard_False;
+  }
+
+  const Standard_Real aFirst = theCurve->FirstParameter();
+  const Standard_Real aLast  = theCurve->LastParameter();
+  if (Precision::IsNegativeInfinite(aFirst) || Precision::IsPositiveInfinite(aFirst)
+      || Precision::IsNegativeInfinite(aLast) || Precision::IsPositiveInfinite(aLast))
+  {
+    return Standard_False;
+  }
+
+  Standard_Real aUmin, aUmax, aVmin, aVmax;
+  theSurface->Bounds(aUmin, aUmax, aVmin, aVmax);
+  if (Precision::IsNegativeInfinite(aUmin) || Precision::IsPositiveInfinite(aUmax)
+      || Precision::IsNegativeInfinite(aVmin) || Precision::IsPositiveInfinite(aVmax))
+  {
+    return Standard_False;
+  }
+
+  GeomAdaptor_Surface anASurface;
+  anASurface.Load(theSurface, aUmin, aUmax, aVmin, aVmax);
+
+  Extrema_ExtPS anExtrema;
+  anExtrema.Initialize(
+    anASurface, aUmin, aUmax, aVmin, aVmax, Precision::PConfusion(), Precision::PConfusion());
+
+  const Standard_Integer aNbPts = Max(2, theNbSamples);
+  const Standard_Real    aDT    = (aLast - aFirst) / (aNbPts - 1);
+
+  for (Standard_Integer i = 0; i < aNbPts; ++i)
+  {
+    const Standard_Real aT = (i == aNbPts - 1) ? aLast : (aFirst + i * aDT);
+    anExtrema.Perform(theCurve->Value(aT));
+    if (!anExtrema.IsDone() || anExtrema.NbExt() < 1)
+    {
+      return Standard_False;
+    }
+
+    Standard_Real aMinDist2 = anExtrema.SquareDistance(1);
+    for (Standard_Integer k = 2; k <= anExtrema.NbExt(); ++k)
+    {
+      aMinDist2 = Min(aMinDist2, anExtrema.SquareDistance(k));
+    }
+
+    theMaxDeviation = Max(theMaxDeviation, std::sqrt(aMinDist2));
+  }
+
+  return Standard_True;
+}
+
+//=================================================================================================
+
+static void UnwrapPeriodicBSpline2d(const Handle(Geom_Surface)&        theSurface,
+                                    const Handle(Geom2d_BSplineCurve)& theCurve)
+{
+  if (theSurface.IsNull() || theCurve.IsNull() || theCurve->NbPoles() < 2)
+  {
+    return;
+  }
+
+  const Standard_Boolean isUPer = theSurface->IsUPeriodic();
+  const Standard_Boolean isVPer = theSurface->IsVPeriodic();
+  if (!isUPer && !isVPer)
+  {
+    return;
+  }
+
+  const Standard_Real aUPer = isUPer ? theSurface->UPeriod() : 0.0;
+  const Standard_Real aVPer = isVPer ? theSurface->VPeriod() : 0.0;
+  if ((isUPer && aUPer <= Precision::PConfusion()) || (isVPer && aVPer <= Precision::PConfusion()))
+  {
+    return;
+  }
+
+  gp_Pnt2d aPrev = theCurve->Pole(1);
+  for (Standard_Integer i = 2; i <= theCurve->NbPoles(); ++i)
+  {
+    gp_Pnt2d aPole = theCurve->Pole(i);
+    Standard_Real aU = aPole.X();
+    Standard_Real aV = aPole.Y();
+
+    if (isUPer)
+    {
+      while ((aU - aPrev.X()) > 0.5 * aUPer)
+        aU -= aUPer;
+      while ((aU - aPrev.X()) < -0.5 * aUPer)
+        aU += aUPer;
+    }
+    if (isVPer)
+    {
+      while ((aV - aPrev.Y()) > 0.5 * aVPer)
+        aV -= aVPer;
+      while ((aV - aPrev.Y()) < -0.5 * aVPer)
+        aV += aVPer;
+    }
+
+    aPole.SetCoord(aU, aV);
+    theCurve->SetPole(i, aPole);
+    aPrev = aPole;
   }
 }
 
@@ -936,6 +1057,46 @@ void GeomInt_IntSS::MakeCurve(const Standard_Integer             Index,
                     BS->SetPole(BS->NbPoles(), aPm);
                   }
                 }
+
+                Standard_Boolean aUseWLineFallback = Standard_False;
+                if (aNbMultiCurves == 1 && (IsPeriodicSurface(aS1) || IsPeriodicSurface(aS2)))
+                {
+                  Standard_Real aDevOnS1 = 0.0, aDevOnS2 = 0.0;
+                  const Standard_Real aApproxTol3d = Max(myTolApprox, theapp3d.TolReached3d());
+                  const Standard_Real aDevLimit    = Max(1.e-3, 1000.0 * aApproxTol3d);
+                  const Standard_Boolean aHasDev1 =
+                    MaxCurveSurfaceDeviation(BS, aS1, 17, aDevOnS1);
+                  const Standard_Boolean aHasDev2 =
+                    MaxCurveSurfaceDeviation(BS, aS2, 17, aDevOnS2);
+                  aUseWLineFallback =
+                    (!aHasDev1 || !aHasDev2 || aDevOnS1 > aDevLimit || aDevOnS2 > aDevLimit);
+
+                  if (aUseWLineFallback)
+                  {
+                    std::cout << "[GeomInt_IntSS] WLineApproxFallback idx=" << Index
+                              << " part=" << i << " dev1=" << aDevOnS1 << " dev2=" << aDevOnS2
+                              << " limit=" << aDevLimit << " ifprm=" << ifprm
+                              << " ilprm=" << ilprm << std::endl;
+                    Handle(Geom2d_BSplineCurve) aH1, aH2;
+                    if (myApprox1)
+                    {
+                      aH1 = MakeBSpline2d(WL, ifprm, ilprm, Standard_True);
+                      UnwrapPeriodicBSpline2d(aS1, aH1);
+                      AdjustUPeriodic(aS1, aH1);
+                    }
+                    if (myApprox2)
+                    {
+                      aH2 = MakeBSpline2d(WL, ifprm, ilprm, Standard_False);
+                      UnwrapPeriodicBSpline2d(aS2, aH2);
+                      AdjustUPeriodic(aS2, aH2);
+                    }
+                    sline.Append(MakeBSpline(WL, ifprm, ilprm));
+                    slineS1.Append(aH1);
+                    slineS2.Append(aH2);
+                    continue;
+                  }
+                }
+
                 sline.Append(BS);
 
                 if (myApprox1)

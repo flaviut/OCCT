@@ -105,6 +105,7 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_SequenceOfShape.hxx>
 
+#include <iostream>
 #include <stdio.h>
 
 // The constant defines the maximal value to enlarge surfaces.
@@ -710,6 +711,60 @@ static Standard_Boolean IsOnSurface(const Handle(Geom_Curve)&   C,
 
 //=================================================================================================
 
+static Standard_Boolean MaxSameParamDeviation(const TopoDS_Edge&    theEdge,
+                                              const TopoDS_Face&    theFace,
+                                              const Standard_Integer theNbSamples,
+                                              Standard_Real&         theMaxDeviation)
+{
+  theMaxDeviation = 0.0;
+  if (theNbSamples < 2)
+  {
+    return Standard_False;
+  }
+
+  Standard_Real      aC3dFirst = 0.0, aC3dLast = 0.0;
+  Handle(Geom_Curve) aC3d      = BRep_Tool::Curve(theEdge, aC3dFirst, aC3dLast);
+  if (aC3d.IsNull())
+  {
+    return Standard_False;
+  }
+
+  Standard_Real        aPCFirst = 0.0, aPCLast = 0.0;
+  Handle(Geom2d_Curve) aPCurve  = BRep_Tool::CurveOnSurface(theEdge, theFace, aPCFirst, aPCLast);
+  if (aPCurve.IsNull())
+  {
+    return Standard_False;
+  }
+
+  Handle(Geom_Surface) aSurface = BRep_Tool::Surface(theFace);
+  if (aSurface.IsNull())
+  {
+    return Standard_False;
+  }
+
+  const Standard_Real aFirst = Max(aC3dFirst, aPCFirst);
+  const Standard_Real aLast  = Min(aC3dLast, aPCLast);
+  if (aLast < aFirst)
+  {
+    return Standard_False;
+  }
+
+  const Standard_Integer aNbPts = Max(2, theNbSamples);
+  const Standard_Real    aDT    = (aLast - aFirst) / (aNbPts - 1);
+  for (Standard_Integer anIdx = 0; anIdx < aNbPts; ++anIdx)
+  {
+    const Standard_Real aT = (anIdx == aNbPts - 1) ? aLast : (aFirst + anIdx * aDT);
+    const gp_Pnt        aP3 = aC3d->Value(aT);
+    const gp_Pnt2d      aUV = aPCurve->Value(aT);
+    const gp_Pnt        aPS = aSurface->Value(aUV.X(), aUV.Y());
+    theMaxDeviation         = Max(theMaxDeviation, aP3.Distance(aPS));
+  }
+
+  return Standard_True;
+}
+
+//=================================================================================================
+
 void BRepOffset_Tool::PipeInter(const TopoDS_Face&    F1,
                                 const TopoDS_Face&    F2,
                                 TopTools_ListOfShape& L1,
@@ -744,11 +799,52 @@ void BRepOffset_Tool::PipeInter(const TopoDS_Face&    F1,
       CI = Inter.Line(i);
       if (ToSmall(CI))
         continue;
+      Standard_Real    aTolOnS1 = 0., aTolOnS2 = 0.;
+      Standard_Boolean aOkOnS1  = IsOnSurface(CI, S1, Precision::Confusion(), aTolOnS1);
+      Standard_Boolean aOkOnS2  = IsOnSurface(CI, S2, Precision::Confusion(), aTolOnS2);
+      Standard_Boolean aNeedFallbackToInter3d =
+        (!aOkOnS1 || !aOkOnS2) && (Max(aTolOnS1, aTolOnS2) > 1.e-3);
+      std::cout << "[PipeInterDiag] line=" << i << " ok1=" << (aOkOnS1 ? 1 : 0)
+                << " dev1=" << aTolOnS1 << " ok2=" << (aOkOnS2 ? 1 : 0)
+                << " dev2=" << aTolOnS2 << " fallback=" << (aNeedFallbackToInter3d ? 1 : 0)
+                << std::endl;
+      if (aNeedFallbackToInter3d)
+      {
+        TopoDS_Edge aNullEdge;
+        TopoDS_Face aNullFace;
+        L1.Clear();
+        L2.Clear();
+        BRepOffset_Tool::Inter3D(F1, F2, L1, L2, Side, aNullEdge, aNullFace, aNullFace);
+        return;
+      }
       TopoDS_Edge E = BRepLib_MakeEdge(CI);
+      Standard_Real aFirst, aLast;
+      BRep_Tool::Range(E, aFirst, aLast);
+      Handle(Geom_TrimmedCurve) aCITrim;
+      if (!CI.IsNull())
+      {
+        aCITrim = new Geom_TrimmedCurve(CI, aFirst, aLast);
+      }
       if (Inter.HasLineOnS1(i))
       {
         Handle(Geom2d_Curve) C2 = Inter.LineOnS1(i);
         PutInBounds(F1, E, C2);
+        if (!aCITrim.IsNull())
+        {
+          Handle(Geom2d_Curve) aC2dAdj;
+          if (CI->IsPeriodic())
+          {
+            BOPTools_AlgoTools2D::AdjustPCurveOnFace(F1, aFirst, aLast, C2, aC2dAdj);
+          }
+          else
+          {
+            BOPTools_AlgoTools2D::AdjustPCurveOnFace(F1, aCITrim, C2, aC2dAdj);
+          }
+          if (!aC2dAdj.IsNull())
+          {
+            C2 = aC2dAdj;
+          }
+        }
         B.UpdateEdge(E, C2, F1, BRep_Tool::Tolerance(E));
       }
       else
@@ -759,11 +855,72 @@ void BRepOffset_Tool::PipeInter(const TopoDS_Face&    F1,
       {
         Handle(Geom2d_Curve) C2 = Inter.LineOnS2(i);
         PutInBounds(F2, E, C2);
+        if (!aCITrim.IsNull())
+        {
+          Handle(Geom2d_Curve) aC2dAdj;
+          if (CI->IsPeriodic())
+          {
+            BOPTools_AlgoTools2D::AdjustPCurveOnFace(F2, aFirst, aLast, C2, aC2dAdj);
+          }
+          else
+          {
+            BOPTools_AlgoTools2D::AdjustPCurveOnFace(F2, aCITrim, C2, aC2dAdj);
+          }
+          if (!aC2dAdj.IsNull())
+          {
+            C2 = aC2dAdj;
+          }
+        }
         B.UpdateEdge(E, C2, F2, BRep_Tool::Tolerance(E));
       }
       else
       {
         BuildPCurves(E, F2);
+      }
+      BRepLib::SameRange(E);
+      // Tube/tube intersection edges may receive multiple pcurves from IntSS and be
+      // reused later during loop reconstruction; force same-parameter consistency now
+      // to prevent tolerance blow-up and invalid wires in arc-join results.
+      const Standard_Real aSameParTol =
+        Max(Precision::Confusion(), 2.0 * Max(aTolOnS1, aTolOnS2));
+      BRepLib::SameParameter(E, aSameParTol, true);
+      const Standard_Boolean aSameParFlag = BRep_Tool::SameParameter(E);
+      if (!aSameParFlag)
+      {
+        Standard_Real    aSameTDevOnS1 = 0.0, aSameTDevOnS2 = 0.0;
+        Standard_Boolean aHasSameTDev1 = MaxSameParamDeviation(E, F1, 17, aSameTDevOnS1);
+        Standard_Boolean aHasSameTDev2 = MaxSameParamDeviation(E, F2, 17, aSameTDevOnS2);
+        const Standard_Real aSameTDevMax = Max(aSameTDevOnS1, aSameTDevOnS2);
+        Handle(Geom_Curve) aC3d;
+        Standard_Real      aCf = 0.0, aCl = 0.0;
+        aC3d = BRep_Tool::Curve(E, aCf, aCl);
+        std::cout << "[PipeInterDiag] samepar_failed line=" << i << " tol=" << aSameParTol
+                  << " range=" << aCf << ".." << aCl << " hasSameT1=" << (aHasSameTDev1 ? 1 : 0)
+                  << " devSameT1=" << aSameTDevOnS1 << " hasSameT2=" << (aHasSameTDev2 ? 1 : 0)
+                  << " devSameT2=" << aSameTDevOnS2;
+        if (!aC3d.IsNull())
+        {
+          std::cout << " c3d=" << aC3d->DynamicType()->Name();
+          const Handle(Geom_BSplineCurve) aBs3d = Handle(Geom_BSplineCurve)::DownCast(aC3d);
+          if (!aBs3d.IsNull())
+          {
+            std::cout << " deg=" << aBs3d->Degree() << " poles=" << aBs3d->NbPoles();
+          }
+        }
+        std::cout << std::endl;
+
+        const Standard_Real aTrustedSameTLimit = Max(1.e-6, 4.0 * aSameParTol);
+        if (aHasSameTDev1 && aHasSameTDev2 && aSameTDevMax <= aTrustedSameTLimit)
+        {
+          if (BRep_Tool::Tolerance(E) < aSameTDevMax)
+          {
+            B.UpdateEdge(E, aSameTDevMax);
+          }
+          B.SameParameter(E, Standard_True);
+          std::cout << "[PipeInterDiag] samepar_forced line=" << i
+                    << " devSameTMax=" << aSameTDevMax << " limit=" << aTrustedSameTLimit
+                    << std::endl;
+        }
       }
       OrientSection(E, F1, F2, O1, O2);
       if (Side == TopAbs_OUT)
