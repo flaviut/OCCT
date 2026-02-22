@@ -76,6 +76,7 @@
 #include <GeomAPI.hxx>
 #include <GeomAPI_ExtremaCurveCurve.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
+#include <Extrema_ExtPS.hxx>
 #include <GeomConvert_ApproxCurve.hxx>
 #include <GeomConvert_CompCurveToBSplineCurve.hxx>
 #include <GeomInt_IntSS.hxx>
@@ -105,6 +106,7 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_SequenceOfShape.hxx>
 
+#include <cmath>
 #include <iostream>
 #include <stdio.h>
 
@@ -702,7 +704,41 @@ static Standard_Boolean IsOnSurface(const Handle(Geom_Curve)&   C,
     }
 
     default: {
-      return Standard_False;
+      Standard_Real aUmin = 0., aUmax = 0., aVmin = 0., aVmax = 0.;
+      S->Bounds(aUmin, aUmax, aVmin, aVmax);
+      if (Precision::IsNegativeInfinite(aUmin) || Precision::IsPositiveInfinite(aUmax)
+          || Precision::IsNegativeInfinite(aVmin) || Precision::IsPositiveInfinite(aVmax))
+      {
+        return Standard_False;
+      }
+
+      Extrema_ExtPS aExtrema;
+      aExtrema.Initialize(AS,
+                          aUmin,
+                          aUmax,
+                          aVmin,
+                          aVmax,
+                          Precision::PConfusion(),
+                          Precision::PConfusion());
+      for (Standard_Integer i = 0; i < n; i++)
+      {
+        P = C->Value(f + i * du);
+        aExtrema.Perform(P);
+        if (!aExtrema.IsDone() || aExtrema.NbExt() < 1)
+        {
+          return Standard_False;
+        }
+
+        Standard_Real aMinDist2 = aExtrema.SquareDistance(1);
+        for (Standard_Integer k = 2; k <= aExtrema.NbExt(); ++k)
+        {
+          aMinDist2 = Min(aMinDist2, aExtrema.SquareDistance(k));
+        }
+        TolReached = Max(TolReached, std::sqrt(aMinDist2));
+        if (TolReached > TolConf)
+          return Standard_False;
+      }
+      break;
     }
   }
 

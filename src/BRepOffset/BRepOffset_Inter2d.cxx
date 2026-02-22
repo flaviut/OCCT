@@ -20,6 +20,7 @@
 
 #include <BOPTools_AlgoTools.hxx>
 #include <BRep_Builder.hxx>
+#include <BRep_CurveRepresentation.hxx>
 #include <BRep_GCurve.hxx>
 #include <BRep_TEdge.hxx>
 #include <BRep_Tool.hxx>
@@ -43,6 +44,7 @@
 #include <Geom2dConvert_CompCurveToBSplineCurve.hxx>
 #include <Geom2dInt_GInter.hxx>
 #include <Geom_BSplineCurve.hxx>
+#include <Geom_Circle.hxx>
 #include <Geom_BSplineSurface.hxx>
 #include <Geom_ConicalSurface.hxx>
 #include <Geom_CylindricalSurface.hxx>
@@ -1149,6 +1151,32 @@ Standard_Boolean BRepOffset_Inter2d::ExtentEdge(const TopoDS_Edge&  E,
   //  NE = TopoDS::Edge(E.EmptyCopied());
   // Enough for analytic edges, for general case reconstruct the
   // geometry of the edge recalculating the intersection of surfaces.
+
+  // Circular edges can already carry consistent pcurves on multiple support faces.
+  // Extending/reprojecting them here may desynchronize one pcurve (observed on cone/sphere
+  // and cone/cone transitions in intersection-join mode), so keep the copied edge unchanged.
+  {
+    Standard_Real      aCf = 0.0, aCl = 0.0;
+    Handle(Geom_Curve) aC3d = BRep_Tool::Curve(E, aCf, aCl);
+    if (!aC3d.IsNull() && aC3d->IsKind(STANDARD_TYPE(Geom_Circle)))
+    {
+      Standard_Integer aNbPC = 0;
+      BRep_ListIteratorOfListOfCurveRepresentation aItCR(
+        (Handle(BRep_TEdge)::DownCast(NE.TShape()))->ChangeCurves());
+      for (; aItCR.More(); aItCR.Next())
+      {
+        const Handle(BRep_CurveRepresentation)& aCR = aItCR.Value();
+        if (!aCR.IsNull() && aCR->IsCurveOnSurface())
+        {
+          ++aNbPC;
+        }
+      }
+      if (aNbPC > 1)
+      {
+        return Standard_True;
+      }
+    }
+  }
 
   // BRepLib::BuildCurve3d(E);
 

@@ -13,6 +13,35 @@
   - result tolerance for the baseline `+1.0, join=a` case is back to normal scale (`Tolerance MAX ~1.1e-6`; no ~20+ vertex tolerance inflation)
   - the follow-up `BRepCheck_InvalidSameParameterFlag` on the fallback-generated tube/tube edge is now resolved locally in `PipeInter()` by a measured same-`t` validation (3D curve vs both pcurves on support faces) and conditional `SameParameter` flag assignment when deviation is already small
   - baseline `+1.0, join=a` now validates again (`checkshape r`), and the join/tol/remove_internal matrix classifications match the expected/non-regressed pattern (all tested positive offsets valid; negative-offset classifications unchanged)
+  - additional local stress testcase `wrench.brep` (conical seam-adjacent wrench-head-like cutout) reproduced a similar arc-path invalidity:
+    - `join=a` initially failed (`BRepCheck_UnorientableShape` / `BRepCheck_NotClosed`)
+    - failing subwire was a seam-adjacent cone/cone loop with a large inflated seam-vertex tolerance
+    - `PipeInter()` diagnostics showed `ok=0, dev=0` because the local curve-on-surface validator did not handle wrapped/non-elementary pipe faces
+  - local `PipeInter()` support-surface validation now handles generic surfaces via `Extrema_ExtPS` fallback in `IsOnSurface(...)`, which re-enables the existing `Inter3D()` containment fallback for bad `GeomInt_IntSS` sections on wrapped cone/cone pipe faces
+  - with that change, `wrench.brep` `+1.0, join=a` validates (`checkshape r`) again; quarter-sphere baseline remains valid (no observed regression in the prior repro)
+  - `wrench.brep` `+1.0, join=i` remains invalid and appears to be a separate issue (not part of the arc-join fix path)
+  - `wrench.brep` characterization sweep (same local matrix dimensions as the quarter-sphere case) indicates:
+    - `join=a`, positive offsets: valid for tested tolerances (`1e-7`..`1e-5`) and `remove_internal` (`0/1`)
+    - `join=a`, negative offsets: still invalid (`BRepCheck_UnorientableShape`)
+    - `join=i`, both offset signs: consistently invalid (`BRepCheck_SelfIntersectingWire`) for tested tolerances / `remove_internal`
+  - `wrench.brep` `join=i` follow-up investigation (new):
+    - independent flag sweep showed `intersection` / `selfInter` flags do not change the failure class for `join=i` (`intersection=1` only amplified tolerance before the local fix attempt)
+    - disabling final `UpdateTolerance(...)` (temporary local experiment) exposed earlier raw defects:
+      - `BRepCheck_InvalidCurveOnSurface`
+      - `BRepCheck_InvalidSameParameterFlag`
+      - `BRepCheck_InvalidPointOnCurve*`
+      before the downstream `SelfIntersectingWire` / `UnorientableShape` reports
+    - localized raw faulty edges are analytic circles on cone/cone, cone/cylinder, and cone/sphere transitions with two pcurves, where one support pcurve is geometrically exact while the other is offset on the support surface by ~`3e-2`..`9e-2`
+    - temporary `BRepOffset_Inter2d::ExtentEdge(...)` diagnostics confirmed these bad pcurves are already created inside `ExtentEdge()` (same-`t` curve-vs-pcurve-on-surface deviation nonzero on one support, zero on the other)
+    - temporary isolation switch skipping `ExtentEdge()` modifications for multi-pcurve circle edges restored `wrench.brep` `+1.0, join=i` validity and reduced the raw invalid edge set, localizing the issue to `ExtentEdge()` circle handling
+  - local `join=i` fix candidate validated:
+    - `BRepOffset_Inter2d::ExtentEdge(...)` now preserves the copied edge (skips extension/reprojection) for analytic circle edges carrying multiple pcurves
+    - rationale: these edges can already carry consistent pcurves on multiple supports; re-extension/reprojection can desynchronize one pcurve (observed on cone/cone and cone/sphere transitions)
+    - `wrench.brep` matrix after this local fix:
+      - `join=i`, positive offsets (`+1.0`): valid for tested tolerances and `remove_internal` values
+      - `join=i`, negative offsets (`-1.0`): unchanged `BRepCheck_SelfIntersectingWire`
+    - quarter-sphere baseline and matrix remain unchanged (positive `join=i` valid; negative `join=i` still `BRepCheck_IntersectingWires`)
+    - note: `wrench.brep` with `join=i` and `intersection=1` still shows a separate invalidity (`UnorientableShape` / `NotClosed`) after the `ExtentEdge()` circle fix, but the previous large tolerance blow-up is removed
 - API path confirmed: DRAW `mkoffsetshape` calls `BRepOffsetAPI_MakeOffsetShape::PerformByJoin(...)`.
 
 ## Goal
@@ -173,6 +202,18 @@ Status: In Progress
       - baseline `+1.0, join=a` passes `checkshape`
       - baseline tolerance remains normal (~`1.1e-6` max)
       - matrix sweep restores the earlier expected classification pattern (positive offsets valid; negative-offset cases unchanged)
+  - Additional arc-path testcase (`wrench.brep`, conical seam stress shape) findings:
+    - `join=a` invalidity localized to a seam-adjacent cone/cone wire with `NotClosed` + `UnorientableShape`; one seam vertex tolerance inflated to ~`9.2e-2`
+    - unlike the quarter-sphere torus/torus case, the bad section was not initially caught by `PipeInter()` diagnostics because `IsOnSurface(...)` returned unsupported for wrapped/non-elementary support surfaces (reported as `ok=0, dev=0`)
+    - extending `BRepOffset_Tool::IsOnSurface(...)` with a generic `Extrema_ExtPS` distance check for non-elementary surfaces exposed large off-surface section deviations (observed ~`8e-2`..`4e-1` on several cone/cone pipe pairs)
+    - this made the existing `PipeInter()->Inter3D()` fallback trigger (`fallback=1`) and restored validity for `wrench.brep` `+1.0, join=a`
+    - `join=i` on `wrench.brep` remains invalid and is likely a distinct issue path
+    - matrix behavior confirms the `join=i` failure is stable across sign/tolerance/`remove_internal` in this testcase, strengthening the split from the arc-path bug fixed here
+  - `join=i` path root-cause progress on `wrench.brep`:
+    - split the failure into earlier curve/pcurve consistency defects vs later tolerance/wire artifacts using an `UpdateTolerance(...)` skip experiment
+    - traced the earliest reproducible raw defects to `BRepOffset_Inter2d::ExtentEdge(...)` on multi-pcurve analytic circle edges
+    - identified that `ExtentEdge()` can leave one pcurve exact and another off-support on cone/sphere-family transitions
+    - validated a localized workaround/fix path by preserving multi-pcurve circle edges in `ExtentEdge()`
 5. Fix plan (targeted, system-aware):
    - Goal:
      - fix the earliest arc-join geometry inconsistency (curve-on-surface / same-parameter / wire orientation), not merely suppress downstream checks or tolerance growth
@@ -194,12 +235,20 @@ Status: In Progress
       - only then revisit additional pcurve/range/orientation consistency on reused arc-path edges
       - face orientation normalization only if still needed after curve/pcurve consistency is fixed
     - reject fixes that only increase tolerances or silence checks without producing valid geometry
-   - Step C: Re-verify full pipeline behavior
+  - Step C: Re-verify full pipeline behavior
      - baseline repro (`join=a`, `+1.0`) must become valid (`checkshape r`)
      - control case (`join=i`, `+1.0`) must remain valid
      - negative-offset cases (`-1.0`) should not regress in classification without explicit intent
      - rerun at least the current matrix summary sweep to catch accidental regressions in `join`/`tol`/`remove_internal`
      - Status: completed locally for current patch set
+     - added spot verification on `wrench.brep`:
+       - `+1.0, join=a` now valid after generic `PipeInter` support-surface validation fix
+       - `+1.0, join=i` still invalid (tracked separately)
+     - local `wrench.brep` matrix sweep confirms no regression in the repaired `join=a` positive-offset cases and shows a stable separate `join=i` self-intersection failure pattern
+     - after the `ExtentEdge()` circle-edge fix candidate:
+       - `wrench.brep` `join=i` positive-offset cases now validate across the tested matrix
+       - `wrench.brep` `join=i` negative-offset cases remain invalid (`SelfIntersectingWire`)
+       - quarter-sphere baseline/matrix classifications are unchanged
    - Step D: Regression test coverage
      - add a `TKOffset` regression test using the exported `.brep` (or a minimized reproducible shape if feasible)
      - assert validity for the arc-join positive-offset case once fixed
@@ -233,6 +282,9 @@ Status: In Progress
   - Current local fix consists of:
     - root-side `GeomInt_IntSS` WLine approximation validation/fallback for periodic-surface bad branches
     - `PipeInter()` measured same-`t` fallback to set `SameParameter` only when the fallback-generated edge is already geometrically consistent
+    - `PipeInter()` generic support-surface validation in `IsOnSurface(...)` (`Extrema_ExtPS` fallback for wrapped/non-elementary surfaces), enabling `Inter3D()` containment fallback on seam-heavy cone/cone pipe cases
+    - `GeomInt_IntSS` periodic WLine approximation validation/fallback coverage extended into plane/non-plane approximation branches (preventive coverage; not required to trigger for the current `wrench.brep` arc repro)
+    - `BRepOffset_Inter2d::ExtentEdge(...)` preservation of multi-pcurve analytic circle edges (skip extension/reprojection for that subset), fixing the `wrench.brep` `join=i` positive-offset invalidity in local testing
 
 ## Notes / Constraints
 

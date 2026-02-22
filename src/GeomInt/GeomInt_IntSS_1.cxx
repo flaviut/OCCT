@@ -918,6 +918,44 @@ void GeomInt_IntSS::MakeCurve(const Standard_Integer             Index,
                 GeomLib_CheckBSplineCurve Check(BS, myTolCheck, myTolAngCheck);
                 Check.FixTangent(Standard_True, Standard_True);
                 //
+                if (aNbMultiCurves == 1 && (IsPeriodicSurface(aS1) || IsPeriodicSurface(aS2)))
+                {
+                  Standard_Real aDevOnS1 = 0.0, aDevOnS2 = 0.0;
+                  const Standard_Real aApproxTol3d = Max(myTolApprox, theapp3d.TolReached3d());
+                  const Standard_Real aDevLimit    = Max(1.e-3, 1000.0 * aApproxTol3d);
+                  const Standard_Boolean aHasDev1 =
+                    MaxCurveSurfaceDeviation(BS, aS1, 17, aDevOnS1);
+                  const Standard_Boolean aHasDev2 =
+                    MaxCurveSurfaceDeviation(BS, aS2, 17, aDevOnS2);
+                  const Standard_Boolean aUseWLineFallback =
+                    (!aHasDev1 || !aHasDev2 || aDevOnS1 > aDevLimit || aDevOnS2 > aDevLimit);
+                  if (aUseWLineFallback)
+                  {
+                    std::cout << "[GeomInt_IntSS] WLineApproxFallback idx=" << Index
+                              << " part=" << i << " branch=plane1"
+                              << " dev1=" << aDevOnS1 << " dev2=" << aDevOnS2
+                              << " limit=" << aDevLimit << " ifprm=" << ifprm
+                              << " ilprm=" << ilprm << std::endl;
+                    Handle(Geom2d_BSplineCurve) aH1, aH2;
+                    if (myApprox1)
+                    {
+                      aH1 = MakeBSpline2d(WL, ifprm, ilprm, Standard_True);
+                      UnwrapPeriodicBSpline2d(aS1, aH1);
+                      AdjustUPeriodic(aS1, aH1);
+                    }
+                    if (myApprox2)
+                    {
+                      aH2 = MakeBSpline2d(WL, ifprm, ilprm, Standard_False);
+                      UnwrapPeriodicBSpline2d(aS2, aH2);
+                      AdjustUPeriodic(aS2, aH2);
+                    }
+                    sline.Append(MakeBSpline(WL, ifprm, ilprm));
+                    slineS1.Append(aH1);
+                    slineS2.Append(aH2);
+                    continue;
+                  }
+                }
+                //
                 sline.Append(BS);
                 //
                 if (myApprox1)
@@ -983,6 +1021,44 @@ void GeomInt_IntSS::MakeCurve(const Standard_Integer             Index,
                                                                      mbspc.Degree());
                 GeomLib_CheckBSplineCurve Check(BS, myTolCheck, myTolAngCheck);
                 Check.FixTangent(Standard_True, Standard_True);
+                //
+                if (aNbMultiCurves == 1 && (IsPeriodicSurface(aS1) || IsPeriodicSurface(aS2)))
+                {
+                  Standard_Real aDevOnS1 = 0.0, aDevOnS2 = 0.0;
+                  const Standard_Real aApproxTol3d = Max(myTolApprox, theapp3d.TolReached3d());
+                  const Standard_Real aDevLimit    = Max(1.e-3, 1000.0 * aApproxTol3d);
+                  const Standard_Boolean aHasDev1 =
+                    MaxCurveSurfaceDeviation(BS, aS1, 17, aDevOnS1);
+                  const Standard_Boolean aHasDev2 =
+                    MaxCurveSurfaceDeviation(BS, aS2, 17, aDevOnS2);
+                  const Standard_Boolean aUseWLineFallback =
+                    (!aHasDev1 || !aHasDev2 || aDevOnS1 > aDevLimit || aDevOnS2 > aDevLimit);
+                  if (aUseWLineFallback)
+                  {
+                    std::cout << "[GeomInt_IntSS] WLineApproxFallback idx=" << Index
+                              << " part=" << i << " branch=plane2"
+                              << " dev1=" << aDevOnS1 << " dev2=" << aDevOnS2
+                              << " limit=" << aDevLimit << " ifprm=" << ifprm
+                              << " ilprm=" << ilprm << std::endl;
+                    Handle(Geom2d_BSplineCurve) aH1, aH2;
+                    if (myApprox1)
+                    {
+                      aH1 = MakeBSpline2d(WL, ifprm, ilprm, Standard_True);
+                      UnwrapPeriodicBSpline2d(aS1, aH1);
+                      AdjustUPeriodic(aS1, aH1);
+                    }
+                    if (myApprox2)
+                    {
+                      aH2 = MakeBSpline2d(WL, ifprm, ilprm, Standard_False);
+                      UnwrapPeriodicBSpline2d(aS2, aH2);
+                      AdjustUPeriodic(aS2, aH2);
+                    }
+                    sline.Append(MakeBSpline(WL, ifprm, ilprm));
+                    slineS1.Append(aH1);
+                    slineS2.Append(aH2);
+                    continue;
+                  }
+                }
                 //
                 sline.Append(BS);
                 //
