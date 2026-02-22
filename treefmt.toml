@@ -1,0 +1,19 @@
+tree-root-file = "shell.nix"
+
+[formatter.clang-format]
+command = "clang-format"
+options = ["-i", "--style=file"]
+includes = [
+  "src/**/*.cpp",
+  "src/**/*.hxx",
+  "src/**/*.cxx",
+  "src/**/*.lxx",
+  "src/**/*.h",
+  "src/**/*.pxx",
+  "src/**/*.hpp",
+  "src/**/*.gxx",
+]
+
+[formatter.nixfmt]
+command = "nixfmt"
+includes = ["*.nix"]
