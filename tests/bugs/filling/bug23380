@@ -17,6 +17,7 @@ donly f_1 d_3 b_2 b_3
 filling result 4 0 0  i  f_1 f 1  d_3 d 1  b_2 0  b_3 0
 
 checknbshapes result -face 1 -wire 1 -edge 4 -vertex 4
+checkshape result
 
 set tolres [checkmaxtol result]
 
