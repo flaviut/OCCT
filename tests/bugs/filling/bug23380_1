@@ -1,0 +1,39 @@
+puts "OCC23380: Tangential filling with a folded initial projection"
+
+brestore [locate_data_file bug23380.brep] b
+explode b
+explode b_1 E
+explode b_5 E
+
+fillingparam -i
+fillingparam -r 3 80 5 0
+fillingparam -a 14 100
+filling result 4 0 0 b_4 b_1_1 b_1 1 b_5_3 b_5 1 b_2 0 b_3 0
+fillingparam -i
+
+checknbshapes result -face 1 -wire 1 -edge 4 -vertex 4
+checkshape result -exact
+
+if {[checkmaxtol result] > 0.0001} {
+  puts "Error: excessive filling tolerance"
+}
+
+# b_5 also contributes its existing seam.
+foreach {support expected} {b_1 1 b_5 2} {
+  sewing joined 0.0001 result $support
+  set checked 0
+  foreach edge [explode joined E] {
+    if {[catch {shapeG1continuity joined $edge 2000 1e-12 0.0001 0.01} continuity]} {
+      continue
+    }
+
+    incr checked
+    if {![regexp {the continuity is G1} $continuity]} {
+      puts "Error: filling is not tangent to $support"
+    }
+  }
+
+  if {$checked != $expected} {
+    puts "Error: missing shared boundary with $support"
+  }
+}

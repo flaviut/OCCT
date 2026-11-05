@@ -23,10 +23,12 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Curve2d.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepFill_CurveConstraint.hxx>
 #include <BRepFill_EdgeFaceAndOrder.hxx>
 #include <BRepFill_FaceAndOrder.hxx>
 #include <BRepLib.hxx>
+#include <BRepLib_CheckCurveOnSurface.hxx>
 #include <BRepLib_MakeVertex.hxx>
 #include <BRepLib_MakeEdge.hxx>
 #include <BRepLib_MakeFace.hxx>
@@ -36,7 +38,13 @@
 #include <Geom2d_BezierCurve.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
 #include <Geom2dAdaptor_Curve.hxx>
+#include <Geom2dAPI_InterCurveCurve.hxx>
 #include <Geom_BSplineSurface.hxx>
+#include <Geom_Curve.hxx>
+#include <Geom_TrimmedCurve.hxx>
+#include <GeomConvert.hxx>
+#include <GeomFill_BSplineCurves.hxx>
+#include <GeomProjLib.hxx>
 #include <GeomAdaptor_Surface.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomPlate_CurveConstraint.hxx>
@@ -44,6 +52,7 @@
 #include <GeomPlate_PlateG0Criterion.hxx>
 #include <GeomPlate_PointConstraint.hxx>
 #include <gp_Pnt.hxx>
+#include <IntRes2d_IntersectionPoint.hxx>
 #include <Precision.hxx>
 #include <StdFail_NotDone.hxx>
 #include <Geom2d_Curve.hxx>
@@ -53,6 +62,7 @@
 #include <NCollection_Sequence.hxx>
 #include <gp_XY.hxx>
 #include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
@@ -60,6 +70,120 @@
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Wire.hxx>
 #include <Geom_Surface.hxx>
+
+bool BRepFill_Filling::HasFoldedBounds(const TopoDS_Face& theInitFace) const
+{
+  BRepAdaptor_Surface aSurface(theInitFace);
+  if (aSurface.GetType() != GeomAbs_Plane)
+  {
+    return false;
+  }
+
+  occ::handle<Geom_Curve> aCurves[4];
+  occ::handle<Geom2d_Curve> aPCurves[4];
+  for (int i = 0; i < 4; ++i)
+  {
+    double aFirst, aLast;
+    aCurves[i] = BRep_Tool::Curve(myBoundary(i + 1).myEdge, aFirst, aLast);
+    double aTol = myTol3d;
+    const auto aPCurve = GeomProjLib::Curve2d(aCurves[i],
+                                            aFirst,
+                                            aLast,
+                                            BRep_Tool::Surface(theInitFace),
+                                            aTol);
+    if (aPCurve.IsNull())
+    {
+      return false;
+    }
+    aPCurves[i] = new Geom2d_TrimmedCurve(aPCurve, aFirst, aLast);
+  }
+
+  for (int i = 0; i < 4; ++i)
+  {
+    for (int j = i + 1; j < 4; ++j)
+    {
+      Geom2dAPI_InterCurveCurve anInter(aPCurves[i], aPCurves[j], myTol2d);
+      for (int k = 1; k <= anInter.NbPoints(); ++k)
+      {
+        const auto& aPoint = anInter.Intersector().Point(k);
+        const gp_Pnt aP1 = aCurves[i]->Value(aPoint.ParamOnFirst());
+        const gp_Pnt aP2 = aCurves[j]->Value(aPoint.ParamOnSecond());
+        if (aP1.Distance(aP2) > myTol3d)
+        {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+TopoDS_Face BRepFill_Filling::MakeCoonsFace() const
+{
+  occ::handle<Geom_BSplineCurve> aCurves[4];
+  for (int i = 0; i < 4; ++i)
+  {
+    const auto& aBound = myBoundary(i + 1);
+    if (aBound.myEdge.IsNull()
+        || (aBound.myOrder != GeomAbs_C0 && aBound.myOrder != GeomAbs_G1))
+    {
+      return TopoDS_Face();
+    }
+
+    double aFirst, aLast;
+    const occ::handle<Geom_Curve> aCurve = BRep_Tool::Curve(aBound.myEdge, aFirst, aLast);
+    if (aCurve.IsNull())
+    {
+      return TopoDS_Face();
+    }
+
+    aCurves[i] = GeomConvert::CurveToBSplineCurve(new Geom_TrimmedCurve(aCurve, aFirst, aLast));
+  }
+
+  GeomFill_BSplineCurves aCoons(aCurves[0],
+                              aCurves[1],
+                              aCurves[2],
+                              aCurves[3],
+                              GeomFill_CoonsStyle);
+  return BRepLib_MakeFace(aCoons.Surface(), Precision::Confusion());
+}
+
+static bool ReprojectBounds(const TopoDS_Face& theFace, const double theTol3d)
+{
+  BRep_Builder aBuilder;
+  const occ::handle<Geom_Surface> aSurface = BRep_Tool::Surface(theFace);
+
+  for (TopExp_Explorer anExp(theFace, TopAbs_EDGE); anExp.More(); anExp.Next())
+  {
+    const TopoDS_Edge anEdge = TopoDS::Edge(anExp.Current());
+    double aFirst, aLast;
+    const occ::handle<Geom_Curve> aCurve = BRep_Tool::Curve(anEdge, aFirst, aLast);
+    double aTol = 0.1 * theTol3d;
+    const occ::handle<Geom2d_Curve> aPCurve =
+      GeomProjLib::Curve2d(aCurve, aFirst, aLast, aSurface, aTol);
+    if (aPCurve.IsNull())
+    {
+      return false;
+    }
+
+    aBuilder.UpdateEdge(anEdge, aPCurve, theFace, Precision::Confusion());
+    aBuilder.Range(anEdge, theFace, aFirst, aLast);
+    aBuilder.SameRange(anEdge, true);
+    aBuilder.SameParameter(anEdge, true);
+
+    BRepLib_CheckCurveOnSurface aCheck(anEdge, theFace);
+    aCheck.Perform();
+    if (!aCheck.IsDone() || !(aCheck.MaxDistance() <= theTol3d / 1.01))
+    {
+      return false;
+    }
+
+    aBuilder.UpdateEdge(anEdge, std::max(Precision::Confusion(), 1.01 * aCheck.MaxDistance()));
+  }
+
+  BRepLib::UpdateTolerances(theFace);
+  return BRepCheck_Analyzer(theFace, true, false, true).IsValid();
+}
 
 static gp_Vec MakeFinVec(const TopoDS_Wire& aWire, const TopoDS_Vertex& aVertex)
 {
@@ -301,13 +425,16 @@ int BRepFill_Filling::Add(const double        U,
 //=================================================================================================
 
 void BRepFill_Filling::AddConstraints(
-  const NCollection_Sequence<BRepFill_EdgeFaceAndOrder>& SeqOfConstraints)
+  const NCollection_Sequence<BRepFill_EdgeFaceAndOrder>& SeqOfConstraints,
+  const TopoDS_Face& theInitFace)
 {
   TopoDS_Edge   CurEdge;
   TopoDS_Face   CurFace;
   GeomAbs_Shape CurOrder;
 
   occ::handle<GeomPlate_CurveConstraint> Constr;
+  // Leave room for surface approximation and boundary projection.
+  const double aTol3d = 0.5 * myTol3d;
   int                                    i;
   for (i = 1; i <= SeqOfConstraints.Length(); i++)
   {
@@ -322,7 +449,7 @@ void BRepFill_Filling::AddConstraints(
         occ::handle<BRepAdaptor_Curve> HCurve = new BRepAdaptor_Curve();
         HCurve->Initialize(CurEdge);
         const occ::handle<Adaptor3d_Curve>& aHCurve = HCurve; // to avoid ambiguity
-        Constr = new BRepFill_CurveConstraint(aHCurve, CurOrder, myNbPtsOnCur, myTol3d);
+        Constr = new BRepFill_CurveConstraint(aHCurve, CurOrder, myNbPtsOnCur, aTol3d);
       }
       else
       { // Pas de representation Topologique
@@ -349,7 +476,7 @@ void BRepFill_Filling::AddConstraints(
         Constr = new GeomPlate_CurveConstraint(HCurvOnSurf,
                                                CurOrder,
                                                myNbPtsOnCur,
-                                               myTol3d,
+                                               aTol3d,
                                                myTolAng,
                                                myTolCurv);
       }
@@ -369,15 +496,15 @@ void BRepFill_Filling::AddConstraints(
       Constr = new BRepFill_CurveConstraint(HCurvOnSurf,
                                             CurOrder,
                                             myNbPtsOnCur,
-                                            myTol3d,
+                                            aTol3d,
                                             myTolAng,
                                             myTolCurv);
     }
-    if (myIsInitFaceGiven)
+    if (!theInitFace.IsNull())
     {
       occ::handle<Geom2d_Curve> Curve2d;
       double                    FirstPar, LastPar;
-      Curve2d = BRep_Tool::CurveOnSurface(CurEdge, myInitFace, FirstPar, LastPar);
+      Curve2d = BRep_Tool::CurveOnSurface(CurEdge, theInitFace, FirstPar, LastPar);
       if (!Curve2d.IsNull())
       {
         Curve2d = new Geom2d_TrimmedCurve(Curve2d, FirstPar, LastPar);
@@ -570,11 +697,54 @@ void BRepFill_Filling::FindExtremitiesOfHoles(const NCollection_List<TopoDS_Shap
 
 void BRepFill_Filling::Build()
 {
+  const bool canUseCoons = myBoundary.Length() == 4 && myConstraints.IsEmpty()
+                          && myFreeConstraints.IsEmpty() && myPoints.IsEmpty();
+  TopoDS_Face anInitFace = myIsInitFaceGiven ? myInitFace : TopoDS_Face();
+
+  if (canUseCoons && myIsInitFaceGiven && HasFoldedBounds(myInitFace))
+  {
+    const TopoDS_Face aSeed = MakeCoonsFace();
+    if (!aSeed.IsNull())
+    {
+      BuildWithInit(aSeed);
+      return;
+    }
+  }
+
+  BuildWithInit(anInitFace);
+  if (myIsDone || !canUseCoons)
+  {
+    return;
+  }
+
+  // A boundary-based parameterization avoids folded projections onto the initial plane.
+  try
+  {
+    const TopoDS_Face aSeed = MakeCoonsFace();
+    if (!aSeed.IsNull())
+    {
+      BuildWithInit(aSeed);
+    }
+  }
+  catch (const Standard_Failure&)
+  {
+    myIsDone = false;
+    myFace.Nullify();
+    myOldNewMap.Clear();
+  }
+}
+
+void BRepFill_Filling::BuildWithInit(const TopoDS_Face& theInitFace)
+{
+  myIsDone = false;
+  myFace.Nullify();
+  myOldNewMap.Clear();
+
   myBuilder.reset(new GeomPlate_BuildPlateSurface(myDegree,
                                                   myNbPtsOnCur,
                                                   myNbIter,
                                                   myTol2d,
-                                                  myTol3d,
+                                                  0.5 * myTol3d,
                                                   myTolAng,
                                                   myTolCurv,
                                                   myAnisotropie));
@@ -660,30 +830,28 @@ void BRepFill_Filling::Build()
   } // for (j = 1; j <= myFreeConstraints.Length(); j++)
 
   // Load initial surface to myBuilder if it is given
-  if (myIsInitFaceGiven)
+  if (!theInitFace.IsNull())
   {
     occ::handle<BRepAdaptor_Surface> HSurfInit = new BRepAdaptor_Surface();
-    HSurfInit->Initialize(myInitFace);
+    HSurfInit->Initialize(theInitFace);
     myBuilder->LoadInitSurface(BRep_Tool::Surface(HSurfInit->Face()));
   }
 
   // Adding constraints to myBuilder
-  AddConstraints(myBoundary);
+  AddConstraints(myBoundary, theInitFace);
   myBuilder->SetNbBounds(myBoundary.Length());
-  AddConstraints(myConstraints);
+  AddConstraints(myConstraints, theInitFace);
   for (i = 1; i <= myPoints.Length(); i++)
   {
     myBuilder->Add(myPoints(i));
   }
 
   myBuilder->Perform();
-  if (myBuilder->IsDone())
+
+  // Solver completion does not guarantee that the constraints were satisfied.
+  if (!myBuilder->IsDone() || !(myBuilder->G0Error() <= myTol3d)
+      || !(myBuilder->G1Error() <= myTolAng) || !(myBuilder->G2Error() <= myTolCurv))
   {
-    myIsDone = true;
-  }
-  else
-  {
-    myIsDone = false;
     return;
   }
 
@@ -692,7 +860,7 @@ void BRepFill_Filling::Build()
   // Approximation
   double dmax = 1.1 * myBuilder->G0Error(); //???????????
   // double dmax = myTol3d;
-  if (!myIsInitFaceGiven)
+  if (theInitFace.IsNull())
   {
     double seuil; //?????
 
@@ -707,11 +875,15 @@ void BRepFill_Filling::Build()
   }
   else
   {
-    // clang-format off
-      GeomPlate_MakeApprox Approx( GPlate, myTol3d, myMaxSegments, myMaxDeg, dmax, 0 ); //?????????????
-      //GeomConvert_ApproxSurface Approx( GPlate, myTol3d, GeomAbs_C1, GeomAbs_C1, myMaxDeg, myMaxDeg, myMaxSegments, 1 );
-      //Approx.Dump( std::cout );
-    // clang-format on
+    // Reserve accuracy for the boundary curves without extrapolating the initial surface.
+    GeomPlate_MakeApprox Approx(GPlate,
+                               0.25 * myTol3d,
+                               myMaxSegments,
+                               myMaxDeg,
+                               dmax,
+                               0,
+                               GeomAbs_C1,
+                               1.0);
     Surface = Approx.Surface();
   }
 
@@ -774,7 +946,18 @@ void BRepFill_Filling::Build()
 
   TopoDS_Wire FinalWire = WireFromList(FinalEdges);
 
-  myFace = BRepLib_MakeFace(Surface, FinalWire);
+  TopoDS_Face aFace = BRepLib_MakeFace(Surface, FinalWire);
+
+  // Sparse curve checks can miss parameterization errors between sample points.
+  if (!BRepCheck_Analyzer(aFace, true, false, true).IsValid()
+      && !ReprojectBounds(aFace, myTol3d))
+  {
+    myOldNewMap.Clear();
+    return;
+  }
+
+  myFace = aFace;
+  myIsDone = true;
 }
 
 //=================================================================================================

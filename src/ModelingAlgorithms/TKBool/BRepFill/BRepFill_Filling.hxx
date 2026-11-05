@@ -193,9 +193,16 @@ public:
   Standard_EXPORT double G2Error(const int Index);
 
 private:
+  void BuildWithInit(const TopoDS_Face& theInitFace);
+
+  TopoDS_Face MakeCoonsFace() const;
+
+  bool HasFoldedBounds(const TopoDS_Face& theInitFace) const;
+
   //! Adds constraints to builder
   Standard_EXPORT void AddConstraints(
-    const NCollection_Sequence<BRepFill_EdgeFaceAndOrder>& SeqOfConstraints);
+    const NCollection_Sequence<BRepFill_EdgeFaceAndOrder>& SeqOfConstraints,
+    const TopoDS_Face& theInitFace);
 
   //! Builds wires of maximum length
   Standard_EXPORT void BuildWires(NCollection_List<TopoDS_Shape>& EdgeList,
