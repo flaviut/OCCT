@@ -19,6 +19,9 @@
 #include <BRepOffset_MakeOffset.hxx>
 #include <BRepOffset_Analyse.hxx>
 #include <BRepOffset_Error.hxx>
+#include <BRepOffset_Tool.hxx>
+#include <BRep_Builder.hxx>
+#include <BRep_Tool.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
@@ -34,7 +37,10 @@
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <Geom2d_BezierCurve.hxx>
+#include <Geom_BezierCurve.hxx>
 #include <Geom_Circle.hxx>
+#include <Geom_ConicalSurface.hxx>
 #include <Geom_BezierSurface.hxx>
 #include <Geom_Ellipse.hxx>
 #include <Geom_BSplineCurve.hxx>
@@ -54,7 +60,11 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Wire.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <Poly_PolygonOnTriangulation.hxx>
+#include <Poly_Triangle.hxx>
+#include <Poly_Triangulation.hxx>
 #include <NCollection_List.hxx>
 #include <Precision.hxx>
 
@@ -108,6 +118,180 @@ TEST(BRepOffset_AnalyseTest, ConstructionContinuityOfSplineFace)
       EXPECT_EQ(aNbSharedEdges, 2);
     }
   }
+}
+
+namespace
+{
+constexpr double THE_NARROW_V = 2.0;
+constexpr double THE_WIDE_V   = 8.0;
+constexpr double THE_EDGE_TOL = 3.0e-7;
+
+occ::handle<Geom2d_Curve> makeConePCurve(double theNarrowU, double theWideU)
+{
+  NCollection_Array1<gp_Pnt2d> aPoles(1, 2);
+  aPoles(1) = gp_Pnt2d(theNarrowU, THE_NARROW_V);
+  aPoles(2) = gp_Pnt2d(theWideU, THE_WIDE_V);
+  return new Geom2d_BezierCurve(aPoles);
+}
+
+void makeConePatch(const occ::handle<Geom_ConicalSurface>& theCone,
+                   double                                  theUMax,
+                   TopoDS_Face&                            theFace,
+                   TopoDS_Edge&                            theSide,
+                   TopoDS_Edge&                            theWideRim)
+{
+  theFace = BRepBuilderAPI_MakeFace(theCone, 0.0, theUMax, THE_NARROW_V, THE_WIDE_V, THE_EDGE_TOL);
+  for (TopExp_Explorer anEdges(theFace, TopAbs_EDGE); anEdges.More(); anEdges.Next())
+  {
+    const TopoDS_Edge& anEdge = TopoDS::Edge(anEdges.Current());
+    double             aFirst, aLast;
+    const auto         aPCurve = BRep_Tool::CurveOnSurface(anEdge, theFace, aFirst, aLast);
+    ASSERT_FALSE(aPCurve.IsNull());
+    const gp_Pnt2d aMid = aPCurve->Value((aFirst + aLast) / 2.0);
+    if (std::abs(aMid.X()) < Precision::PConfusion())
+    {
+      theSide = anEdge;
+    }
+    if (std::abs(aMid.Y() - THE_WIDE_V) < Precision::PConfusion())
+    {
+      theWideRim = anEdge;
+    }
+  }
+  ASSERT_FALSE(theSide.IsNull());
+  ASSERT_FALSE(theWideRim.IsNull());
+
+  // Represent the straight side as a Bezier so face extension must extend its pcurves.
+  NCollection_Array1<gp_Pnt> aPoles(1, 2);
+  aPoles(1) = theCone->Value(0.0, THE_NARROW_V);
+  aPoles(2) = theCone->Value(0.0, THE_WIDE_V);
+  BRep_Builder      aBuilder;
+  const TopoDS_Edge aForward = TopoDS::Edge(theSide.Oriented(TopAbs_FORWARD));
+  aBuilder.UpdateEdge(aForward, new Geom_BezierCurve(aPoles), THE_EDGE_TOL);
+  aBuilder.UpdateVertex(TopExp::FirstVertex(aForward), 0.0, aForward, THE_EDGE_TOL);
+  aBuilder.UpdateVertex(TopExp::LastVertex(aForward), 1.0, aForward, THE_EDGE_TOL);
+}
+
+void extendConePatch(const TopoDS_Face& theFace,
+                     const TopoDS_Edge& theWideRim,
+                     const TopoDS_Edge& theSide,
+                     TopoDS_Face&       theResult,
+                     TopoDS_Edge&       theExtendedSide)
+{
+  // Replace the wide rim with the intersection at a plane beyond it.
+  const gp_Pnt      aStopPoint = BRep_Tool::Surface(theFace)->Value(0.0, THE_WIDE_V + 1.0);
+  const TopoDS_Face aStop      = BRepBuilderAPI_MakeFace(gp_Pln(aStopPoint, gp::DZ()));
+  NCollection_DataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher> aBuilt, aToBuild;
+  aToBuild.Bind(theWideRim, aStop);
+  BRepOffset_Tool::ExtentFace(theFace, aBuilt, aToBuild, TopAbs_OUT, THE_EDGE_TOL, theResult);
+  ASSERT_TRUE(aBuilt.IsBound(theSide));
+  theExtendedSide = TopoDS::Edge(aBuilt(theSide));
+
+  double aFirst, aLast;
+  BRep_Tool::Range(theExtendedSide, aFirst, aLast);
+  ASSERT_GT(aLast, 1.0) << "The rebuilt edge must reach beyond the original rim";
+}
+
+void addPolygonPair(const TopoDS_Face& theFace, const TopoDS_Edge& theSide, double theUMax)
+{
+  const auto                            aSurface = BRep_Tool::Surface(theFace);
+  const occ::handle<Poly_Triangulation> aMesh    = new Poly_Triangulation(4, 2, false);
+  aMesh->SetNode(1, aSurface->Value(0.0, THE_NARROW_V));
+  aMesh->SetNode(2, aSurface->Value(0.0, THE_WIDE_V));
+  aMesh->SetNode(3, aSurface->Value(theUMax, THE_NARROW_V));
+  aMesh->SetNode(4, aSurface->Value(theUMax, THE_WIDE_V));
+  aMesh->SetTriangle(1, Poly_Triangle(1, 3, 2));
+  aMesh->SetTriangle(2, Poly_Triangle(2, 3, 4));
+
+  BRep_Builder aBuilder;
+  aBuilder.UpdateFace(theFace, aMesh);
+  NCollection_Array1<int> aNodes(1, 2);
+  aNodes(1) = 1;
+  aNodes(2) = 2;
+  aBuilder.UpdateEdge(theSide,
+                      new Poly_PolygonOnTriangulation(aNodes),
+                      new Poly_PolygonOnTriangulation(aNodes),
+                      aMesh,
+                      TopLoc_Location());
+}
+
+enum class ConeSeam
+{
+  Geometric,
+  PolygonOnly
+};
+
+void checkConeExtension(ConeSeam theSeam)
+{
+  const occ::handle<Geom_ConicalSurface> aCone = new Geom_ConicalSurface(gp::XOY(), 0.6, 1.0);
+
+  const bool   isGeometric = theSeam == ConeSeam::Geometric;
+  const double aUMax       = isGeometric ? aCone->UPeriod() : 1.0;
+  TopoDS_Face  aFace;
+  TopoDS_Edge  aSide, aWideRim;
+  ASSERT_NO_FATAL_FAILURE(makeConePatch(aCone, aUMax, aFace, aSide, aWideRim));
+
+  BRep_Builder              aBuilder;
+  const auto                aNearZero = makeConePCurve(0.0, 0.0);
+  occ::handle<Geom2d_Curve> aNearPeriod;
+  if (isGeometric)
+  {
+    // A constant angular error from the narrow end would exceed tolerance at the wide end.
+    aNearPeriod            = makeConePCurve(aUMax - 1.0e-7, aUMax - 2.0e-9);
+    const bool isZeroFirst = aSide.Orientation() == TopAbs_FORWARD;
+    aBuilder.UpdateEdge(aSide,
+                        isZeroFirst ? aNearZero : aNearPeriod,
+                        isZeroFirst ? aNearPeriod : aNearZero,
+                        aFace,
+                        THE_EDGE_TOL);
+  }
+  else
+  {
+    aBuilder.UpdateEdge(aSide, aNearZero, aFace, THE_EDGE_TOL);
+    addPolygonPair(aFace, aSide, aUMax);
+  }
+  aBuilder.Range(aSide, 0.0, 1.0);
+  ASSERT_TRUE(BRep_Tool::IsClosed(aSide, aFace));
+  ASSERT_EQ(BRep_Tool::IsClosed(aSide, aCone, TopLoc_Location()), isGeometric);
+
+  TopoDS_Face aResult;
+  TopoDS_Edge anExtended;
+  ASSERT_NO_FATAL_FAILURE(extendConePatch(aFace, aWideRim, aSide, aResult, anExtended));
+  TopLoc_Location aLocation;
+  const auto&     aSurface = BRep_Tool::Surface(aResult, aLocation);
+  EXPECT_EQ(BRep_Tool::IsClosed(anExtended, aSurface, aLocation), isGeometric);
+
+  for (const TopAbs_Orientation anOri : {TopAbs_FORWARD, TopAbs_REVERSED})
+  {
+    SCOPED_TRACE(anOri);
+    double     aFirst, aLast;
+    const auto aPCurve =
+      BRep_Tool::CurveOnSurface(TopoDS::Edge(anExtended.Oriented(anOri)), aResult, aFirst, aLast);
+    ASSERT_FALSE(aPCurve.IsNull());
+    EXPECT_GE(aFirst, aPCurve->FirstParameter());
+    EXPECT_LE(aLast, aPCurve->LastParameter());
+
+    const auto& anOriginal = isGeometric && anOri != aSide.Orientation() ? aNearPeriod : aNearZero;
+    for (const double aParam : {0.0, 0.5, 0.9, 1.0})
+    {
+      SCOPED_TRACE(aParam);
+      const gp_Pnt2d aUV       = aPCurve->Value(aParam);
+      const double   aV        = THE_NARROW_V + aParam * (THE_WIDE_V - THE_NARROW_V);
+      const gp_Pnt   aRefPoint = aCone->Value(0.0, aV);
+      EXPECT_LT(aUV.Distance(anOriginal->Value(aParam)), Precision::PConfusion());
+      EXPECT_LE(aSurface->Value(aUV.X(), aUV.Y()).Distance(aRefPoint), THE_EDGE_TOL);
+    }
+  }
+}
+} // namespace
+
+TEST(BRepOffset_ToolTest, ExtentFacePreservesBothSeamPCurves)
+{
+  checkConeExtension(ConeSeam::Geometric);
+}
+
+TEST(BRepOffset_ToolTest, ExtentFaceIgnoresPolygonOnlySeam)
+{
+  checkConeExtension(ConeSeam::PolygonOnly);
 }
 
 //=================================================================================================

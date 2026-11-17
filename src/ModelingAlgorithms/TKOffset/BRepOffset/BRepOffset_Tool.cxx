@@ -2074,90 +2074,107 @@ void BRepOffset_Tool::InterOrExtent(const TopoDS_Face&              F1,
 
 //=================================================================================================
 
+static occ::handle<Geom2d_Curve> ExtentPCurve(const occ::handle<Geom2d_Curve>& theCurve,
+                                              const occ::handle<Geom_Surface>& theSurface,
+                                              const double                     theFirst,
+                                              const double                     theLast)
+{
+  const gp_Pln                   aPlane(gp::XOY());
+  occ::handle<Geom_BoundedCurve> anExtended =
+    occ::down_cast<Geom_BoundedCurve>(GeomAPI::To3d(theCurve, aPlane));
+  if (anExtended.IsNull())
+  {
+    return theCurve;
+  }
+
+  constexpr double aMax = 100.0;
+  double           aUMin, aUMax, aVMin, aVMax;
+  theSurface->Bounds(aUMin, aUMax, aVMin, aVMax);
+  aUMin = std::max(aUMin, -aMax);
+  aVMin = std::max(aVMin, -aMax);
+  aUMax = std::min(aUMax, aMax);
+  aVMax = std::min(aVMax, aMax);
+
+  // Use the nearest UV boundary to limit the tangent extension.
+  const auto aTarget = [&](double theParam, double theDirection) {
+    gp_Pnt2d aPoint;
+    gp_Vec2d aTangent;
+    theCurve->D1(theParam, aPoint, aTangent);
+    double aU = Precision::Infinite();
+    double aV = Precision::Infinite();
+    if (std::abs(aTangent.X()) > Precision::Confusion())
+    {
+      aU = std::min(std::abs((aUMax - aPoint.X()) / aTangent.X()),
+                    std::abs((aUMin - aPoint.X()) / aTangent.X()));
+    }
+    if (std::abs(aTangent.Y()) > Precision::Confusion())
+    {
+      aV = std::min(std::abs((aVMax - aPoint.Y()) / aTangent.Y()),
+                    std::abs((aVMin - aPoint.Y()) / aTangent.Y()));
+    }
+    aPoint.Translate(aTangent * (theDirection * std::min(aU, aV)));
+    return gp_Pnt(aPoint.X(), aPoint.Y(), 0.0);
+  };
+
+  GeomLib::ExtendCurveToPoint(anExtended, aTarget(theFirst, -1.0), 1, false);
+  GeomLib::ExtendCurveToPoint(anExtended, aTarget(theLast, 1.0), 1, true);
+  return GeomAPI::To2d(anExtended, aPlane);
+}
+
+//=================================================================================================
+
 static void ExtentEdge(const TopoDS_Face& F,
                        const TopoDS_Face& EF,
                        const TopoDS_Edge& E,
                        TopoDS_Edge&       NE)
 {
   BRepAdaptor_Curve CE(E);
-  GeomAbs_CurveType Type       = CE.GetType();
-  TopoDS_Shape      aLocalEdge = E.EmptyCopied();
-  NE                           = TopoDS::Edge(aLocalEdge);
-  //  NE = TopoDS::Edge(E.EmptyCopied());
+  GeomAbs_CurveType Type = CE.GetType();
+  NE                     = TopoDS::Edge(E.EmptyCopied());
 
   if (Type == GeomAbs_Line || Type == GeomAbs_Circle || Type == GeomAbs_Ellipse
       || Type == GeomAbs_Hyperbola || Type == GeomAbs_Parabola)
   {
     return;
   }
-  // Extension en tangence jusqu'au bord de la surface.
-  double                    PMax = 1.e2;
-  TopLoc_Location           L;
-  occ::handle<Geom_Surface> S = BRep_Tool::Surface(F, L);
-  double                    umin, umax, vmin, vmax;
 
-  S->Bounds(umin, umax, vmin, vmax);
-  umin = std::max(umin, -PMax);
-  vmin = std::max(vmin, -PMax);
-  umax = std::min(umax, PMax);
-  vmax = std::min(vmax, PMax);
+  TopLoc_Location                  L;
+  const occ::handle<Geom_Surface>& S = BRep_Tool::Surface(F, L);
+  double                           f, l;
+  const auto                       aPCurve =
+    BRep_Tool::CurveOnSurface(TopoDS::Edge(E.Oriented(TopAbs_FORWARD)), S, L, f, l);
 
-  double                    f, l;
-  occ::handle<Geom2d_Curve> C2d = BRep_Tool::CurveOnSurface(E, F, f, l);
-
-  // calcul point cible. ie point d'intersection du prolongement tangent et des bords.
-  gp_Pnt2d P;
-  gp_Vec2d Tang;
-  C2d->D1(CE.FirstParameter(), P, Tang);
-  double tx, ty, tmin;
-  tx = ty = Precision::Infinite();
-  if (std::abs(Tang.X()) > Precision::Confusion())
+  const bool isSeam     = BRep_Tool::IsClosed(E, S, L);
+  const auto anExtended = ExtentPCurve(aPCurve,
+                                      S,
+                                      isSeam ? aPCurve->FirstParameter() : CE.FirstParameter(),
+                                      isSeam ? aPCurve->LastParameter() : CE.LastParameter());
+  occ::handle<Geom2d_Curve> aPCurve2, anExtended2;
+  if (isSeam)
   {
-    tx = std::min(std::abs((umax - P.X()) / Tang.X()), std::abs((umin - P.X()) / Tang.X()));
+    aPCurve2    = BRep_Tool::CurveOnSurface(TopoDS::Edge(E.Oriented(TopAbs_REVERSED)), S, L, f, l);
+    anExtended2 = ExtentPCurve(aPCurve2, S, aPCurve2->FirstParameter(), aPCurve2->LastParameter());
   }
-  if (std::abs(Tang.Y()) > Precision::Confusion())
-  {
-    ty = std::min(std::abs((vmax - P.Y()) / Tang.Y()), std::abs((vmin - P.Y()) / Tang.Y()));
-  }
-  tmin = std::min(tx, ty);
-  Tang = tmin * Tang;
-  gp_Pnt2d PF2d(P.X() - Tang.X(), P.Y() - Tang.Y());
-
-  C2d->D1(CE.LastParameter(), P, Tang);
-  tx = ty = Precision::Infinite();
-  if (std::abs(Tang.X()) > Precision::Confusion())
-  {
-    tx = std::min(std::abs((umax - P.X()) / Tang.X()), std::abs((umin - P.X()) / Tang.X()));
-  }
-  if (std::abs(Tang.Y()) > Precision::Confusion())
-  {
-    ty = std::min(std::abs((vmax - P.Y()) / Tang.Y()), std::abs((vmin - P.Y()) / Tang.Y()));
-  }
-  tmin = std::min(tx, ty);
-  Tang = tmin * Tang;
-  gp_Pnt2d PL2d(P.X() + Tang.X(), P.Y() + Tang.Y());
-
-  occ::handle<Geom_Curve> CC = GeomAPI::To3d(C2d, gp_Pln(gp::XOY()));
-  gp_Pnt                  PF(PF2d.X(), PF2d.Y(), 0.);
-  gp_Pnt                  PL(PL2d.X(), PL2d.Y(), 0.);
-
-  occ::handle<Geom_BoundedCurve> ExtC = occ::down_cast<Geom_BoundedCurve>(CC);
-  if (ExtC.IsNull())
+  if (anExtended == aPCurve && anExtended2 == aPCurve2)
   {
     return;
   }
 
-  GeomLib::ExtendCurveToPoint(ExtC, PF, 1, false);
-  GeomLib::ExtendCurveToPoint(ExtC, PL, 1, true);
-
-  occ::handle<Geom2d_Curve> CNE2d = GeomAPI::To2d(ExtC, gp_Pln(gp::XOY()));
-
-  // Construction de la nouvelle arrete;
   BRep_Builder B;
   B.MakeEdge(NE);
-  //  B.UpdateEdge (NE,CNE2d,F,BRep_Tool::Tolerance(E));
-  B.UpdateEdge(NE, CNE2d, EF, BRep_Tool::Tolerance(E));
-  B.Range(NE, CNE2d->FirstParameter(), CNE2d->LastParameter());
+  double aFirst = anExtended->FirstParameter();
+  double aLast  = anExtended->LastParameter();
+  if (isSeam)
+  {
+    B.UpdateEdge(NE, anExtended, anExtended2, EF, BRep_Tool::Tolerance(E));
+    aFirst = std::max(aFirst, anExtended2->FirstParameter());
+    aLast  = std::min(aLast, anExtended2->LastParameter());
+  }
+  else
+  {
+    B.UpdateEdge(NE, anExtended, EF, BRep_Tool::Tolerance(E));
+  }
+  B.Range(NE, aFirst, aLast);
   NE.Orientation(E.Orientation());
 }
 
@@ -3817,7 +3834,9 @@ void BRepOffset_Tool::ExtentFace(
     //------------------------------------------------
     // Mise a jour des pcurves sur la surface de base.
     //------------------------------------------------
-    TopoDS_Face Fforward = F;
+    TopLoc_Location                  L;
+    const occ::handle<Geom_Surface>& S        = BRep_Tool::Surface(F, L);
+    TopoDS_Face                      Fforward = F;
     Fforward.Orientation(TopAbs_FORWARD);
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> Emap;
     TopExp::MapShapes(Fforward, TopAbs_EDGE, Emap);
@@ -3827,7 +3846,7 @@ void BRepOffset_Tool::ExtentFace(
       TopoDS_Edge CE = TopoDS::Edge(Emap(i));
       CE.Orientation(TopAbs_FORWARD);
       TopoDS_Edge               Ecs; // patch
-      occ::handle<Geom2d_Curve> C2 = BRep_Tool::CurveOnSurface(CE, Fforward, f, l);
+      occ::handle<Geom2d_Curve> C2 = BRep_Tool::CurveOnSurface(CE, S, L, f, l);
       if (!C2.IsNull())
       {
         if (ConstShapes.IsBound(CE))
@@ -3835,13 +3854,10 @@ void BRepOffset_Tool::ExtentFace(
           Ecs = TopoDS::Edge(ConstShapes(CE));
           BRep_Tool::Range(Ecs, f, l);
         }
-        if (BRep_Tool::IsClosed(CE, Fforward))
+        if (BRep_Tool::IsClosed(CE, S, L))
         {
-          TopoDS_Shape              aLocalShapeReversedCE = CE.Reversed();
           occ::handle<Geom2d_Curve> C2R =
-            BRep_Tool::CurveOnSurface(TopoDS::Edge(aLocalShapeReversedCE), Fforward, f, l);
-          //	  occ::handle<Geom2d_Curve> C2R =
-          //	    BRep_Tool::CurveOnSurface(TopoDS::Edge(CE.Reversed()),F,f,l);
+            BRep_Tool::CurveOnSurface(TopoDS::Edge(CE.Reversed()), S, L, f, l);
           B.UpdateEdge(CE, C2, C2R, EF, BRep_Tool::Tolerance(CE));
           if (!Ecs.IsNull())
           {

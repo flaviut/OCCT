@@ -1,0 +1,32 @@
+puts "========================"
+puts "GH1764: Preserve seam pcurves when shelling a circular loft"
+puts "========================"
+
+pload MODELING
+
+foreach radii {{56 23} {23 56} {56 56}} {
+  lassign $radii r0 r1
+  circle c0 0 0 0 $r0
+  circle c1 0 0 80 $r1
+  mkedge e0 c0
+  mkedge e1 c1
+  wire w0 e0
+  wire w1 e1
+  thrusections loft 1 0 w0 w1
+  checkshape loft
+  explode loft F
+
+  foreach cap {loft_2 loft_3} {
+    foreach distance {-5 -1 1 5} {
+      puts "Radii: $radii, removed face: $cap, offset: $distance"
+      if {[isdraw result]} {unset result}
+      offsetshape result loft $distance 1e-7 $cap
+      if {![isdraw result]} {
+        puts "Error: loft shelling produced no result"
+        continue
+      }
+      checkshape result
+      checknbshapes result -shell 1 -solid 1
+    }
+  }
+}
