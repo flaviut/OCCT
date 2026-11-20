@@ -1,0 +1,23 @@
+puts "Arc shelling preserves the wall around a pocket in a cone"
+
+pcone cone 56 23 80
+pcylinder cutter 9.5 80
+ttranslate cutter -49.5 0 8
+bcut pocket cone cutter
+
+# Open the base of the cone, not the floor of the pocket.
+foreach face [explode pocket F] {
+  bounding $face -save xmin ymin zmin xmax ymax zmax
+  if {abs([dval zmin]) < 1e-6 && abs([dval zmax]) < 1e-6} {
+    set opening $face
+    break
+  }
+}
+offsetshape result pocket -5 1e-7 $opening
+checkshape result
+checknbshapes result -solid 1
+
+set report [bopcheck result]
+if {![string match {*This shape seems to be OK*} $report]} {
+  puts "Error: the inner cone intersects the pocket: $report"
+}

@@ -44,6 +44,7 @@
 #include <BRepOffset_Tool.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_WireExplorer.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
 #include <Geom2d_BezierCurve.hxx>
 #include <Geom2d_BSplineCurve.hxx>
 #include <Geom2d_Line.hxx>
@@ -598,6 +599,22 @@ static void EdgeInter(
     }
   }
 
+  const double aTolStore = std::max(Tol, BRep_Tool::Tolerance(E1) + BRep_Tool::Tolerance(E2));
+  const auto   isNearEnd = [aTolStore](const BRepAdaptor_Curve& theCurve,
+                                     const TopoDS_Shape&      theVertex,
+                                     const double             theEnd) {
+    const TopoDS_Vertex aVertex = TopoDS::Vertex(theVertex.Oriented(TopAbs_INTERNAL));
+    const double        aParam  = BRep_Tool::Parameter(aVertex, theCurve.Edge());
+    if (aParam == theEnd)
+    {
+      return true;
+    }
+    return !BRep_Tool::Degenerated(theCurve.Edge())
+           && GCPnts_AbscissaPoint::Length(theCurve, aParam, theEnd, Precision::Confusion())
+                <= aTolStore;
+  };
+  NCollection_List<TopoDS_Shape> aEndPoints1, aEndPoints2;
+
   //----------------------------------
   // Test at end.
   //---------------------------------
@@ -641,12 +658,28 @@ static void EdgeInter(
         TopoDS_Shape aLocalShape = V.Oriented(TopAbs_INTERNAL);
         B.UpdateVertex(TopoDS::Vertex(aLocalShape), U1, E1, aTol);
         B.UpdateVertex(TopoDS::Vertex(aLocalShape), U2, E2, aTol);
-        //
-        LV1.Prepend(V.Oriented(V1[j].Orientation()));
-        LV2.Prepend(V.Oriented(V2[k].Orientation()));
+
+        // Prefer the endpoint match only if the crossing is nearby along both curves.
+        NCollection_List<TopoDS_Shape>::Iterator anIt1(LV1), anIt2(LV2);
+        while (anIt1.More())
+        {
+          if (P1.IsEqual(BRep_Tool::Pnt(TopoDS::Vertex(anIt1.Value())), aTolStore)
+              && isNearEnd(CE1, anIt1.Value(), U1) && isNearEnd(CE2, anIt2.Value(), U2))
+          {
+            LV1.Remove(anIt1);
+            LV2.Remove(anIt2);
+            continue;
+          }
+          anIt1.Next();
+          anIt2.Next();
+        }
+        aEndPoints1.Prepend(V.Oriented(V1[j].Orientation()));
+        aEndPoints2.Prepend(V.Oriented(V2[k].Orientation()));
       }
     }
   }
+  LV1.Prepend(aEndPoints1);
+  LV2.Prepend(aEndPoints2);
 
   bool AffichPurge = false;
 
@@ -701,9 +734,7 @@ static void EdgeInter(
     //---------------------------------
     // Vertex storage in DS.
     //---------------------------------
-    double TolStore = BRep_Tool::Tolerance(E1) + BRep_Tool::Tolerance(E2);
-    TolStore        = std::max(TolStore, Tol);
-    Store(E1, E2, LV1, LV2, TolStore, AsDes, aDMVV);
+    Store(E1, E2, LV1, LV2, aTolStore, AsDes, aDMVV);
   }
 }
 
